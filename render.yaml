@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ffmpeg-shorts-service
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: MAX_DOWNLOAD_MB
+        value: 500
+      - key: API_KEY
+        generateValue: true   # Render generates a secure random value
+    autoDeploy: true

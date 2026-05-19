@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  ffmpeg-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - API_KEY=${API_KEY:-dev-key-change-me}
+      - MAX_DOWNLOAD_MB=500
+    volumes:
+      - shorts-tmp:/tmp/shorts
+    restart: unless-stopped
+
+volumes:
+  shorts-tmp:
