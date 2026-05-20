@@ -1,25 +1,24 @@
 """
-FFmpeg + yt-dlp microservice for YouTube Shorts pipeline.
-Self-contained: downloads YouTube directly, cuts, reformats to 9:16, burns captions.
+AI Shorts Generator microservice.
+Combines AI voiceover + AI images into a 9:16 vertical YouTube Short.
 
 Endpoints:
-  POST /download   — given a YouTube URL, returns direct mp4 URL
-  POST /process    — cut + reformat + caption a clip
+  POST /assemble   — combine audio + images + captions → final video
+  GET  /health     — health check
 """
 import os
 import uuid
 import subprocess
 import shutil
+import base64
 import json
 import requests
-from flask import Flask, request, send_file, jsonify, abort, url_for
+from flask import Flask, request, send_file, jsonify, abort
 
 app = Flask(__name__)
 
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/shorts")
-MAX_DOWNLOAD_MB = int(os.environ.get("MAX_DOWNLOAD_MB", "500"))
 API_KEY = os.environ.get("API_KEY")
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "")
 os.makedirs(WORK_DIR, exist_ok=True)
 
 
@@ -31,48 +30,22 @@ def require_api_key():
         abort(401, description="Invalid or missing API key")
 
 
-def yt_download(url: str, dest: str) -> dict:
-    """Download YouTube video using yt-dlp. Returns metadata."""
-    cmd = [
-        "yt-dlp",
-        "-f", "best[height<=720][ext=mp4]/best[height<=720]/best",
-        "--no-playlist",
-        "--no-warnings",
-        "--quiet",
-        "-o", dest,
-        "--print-json",
-        url,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+def run_ffmpeg(cmd: list) -> None:
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(f"yt-dlp failed: {result.stderr[-2000:]}")
-    
-    # yt-dlp prints metadata as JSON
-    try:
-        meta = json.loads(result.stdout.strip().split("\n")[-1])
-    except Exception:
-        meta = {}
-    
-    return {
-        "title": meta.get("title", ""),
-        "duration": meta.get("duration", 0),
-        "uploader": meta.get("uploader", ""),
-    }
+        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
-def download_file(url: str, dest: str) -> None:
-    """Stream a remote file to disk with a size cap."""
-    with requests.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        total = 0
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                total += len(chunk)
-                if total > MAX_DOWNLOAD_MB * 1024 * 1024:
-                    raise ValueError(f"File exceeds {MAX_DOWNLOAD_MB}MB limit")
-                f.write(chunk)
+def get_audio_duration(audio_path: str) -> float:
+    """Get duration of audio file in seconds."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return float(result.stdout.strip())
 
 
 def ms_to_ass_time(ms: int) -> str:
@@ -83,31 +56,18 @@ def ms_to_ass_time(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 
-def build_ass_subtitles(words, start_sec: float, end_sec: float, out_path: str, style: str = "tiktok"):
-    start_ms = int(start_sec * 1000)
-    end_ms = int(end_sec * 1000)
-    clip_words = []
-    for w in words or []:
-        w_start = w.get("start", 0)
-        w_end = w.get("end", 0)
-        if w_end < start_ms or w_start > end_ms:
-            continue
-        clip_words.append({
-            "text": w.get("text", "").strip(),
-            "start": max(0, w_start - start_ms),
-            "end": max(0, w_end - start_ms),
-        })
+def build_captions(script_text: str, total_duration: float, out_path: str):
+    """Build word-by-word ASS captions from script text."""
+    words = script_text.split()
+    if not words:
+        return
 
-    if style == "tiktok":
-        style_line = (
-            "Style: Default,Liberation Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-            "-1,0,0,0,100,100,0,0,1,6,0,2,40,40,260,1"
-        )
-    else:
-        style_line = (
-            "Style: Default,Liberation Sans,56,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-            "0,0,0,0,100,100,0,0,1,4,0,2,40,40,200,1"
-        )
+    duration_per_word_ms = int((total_duration * 1000) / len(words))
+
+    style_line = (
+        "Style: Default,Liberation Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+        "-1,0,0,0,100,100,0,0,1,8,2,2,40,40,240,1"
+    )
 
     header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 2\n\n"
@@ -122,167 +82,174 @@ def build_ass_subtitles(words, start_sec: float, end_sec: float, out_path: str, 
 
     events = []
     PHRASE_SIZE = 3
-    for i in range(0, len(clip_words), PHRASE_SIZE):
-        phrase = clip_words[i:i + PHRASE_SIZE]
-        if not phrase:
-            continue
-        p_start = phrase[0]["start"]
-        p_end = phrase[-1]["end"]
-        text_parts = []
-        for w in phrase:
-            duration_cs = max(1, (w["end"] - w["start"]) // 10)
-            text_parts.append(r"{\kf%d}%s" % (duration_cs, w["text"].upper()))
-        text = " ".join(text_parts)
+    current_ms = 0
+    for i in range(0, len(words), PHRASE_SIZE):
+        phrase = words[i:i + PHRASE_SIZE]
+        phrase_duration = duration_per_word_ms * len(phrase)
+        start_ms = current_ms
+        end_ms = current_ms + phrase_duration
+        text = " ".join(w.upper() for w in phrase)
         events.append(
-            f"Dialogue: 0,{ms_to_ass_time(p_start)},{ms_to_ass_time(p_end)},Default,,0,0,0,,{text}"
+            f"Dialogue: 0,{ms_to_ass_time(start_ms)},{ms_to_ass_time(end_ms)},Default,,0,0,0,,{text}"
         )
+        current_ms = end_ms
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events))
-
-
-def run_ffmpeg(cmd: list) -> None:
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
 @app.get("/health")
 def health():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
-        subprocess.run(["yt-dlp", "--version"], capture_output=True, check=True, timeout=5)
-        return jsonify({"status": "ok", "ffmpeg": "available", "yt-dlp": "available"})
+        return jsonify({"status": "ok", "ffmpeg": "available", "service": "ai-shorts-v3"})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
 
-@app.post("/download")
-def download():
-    """Download a YouTube video and return the public URL where it's hosted."""
+@app.post("/assemble")
+def assemble():
+    """
+    Assemble a 9:16 vertical short from AI-generated audio + images.
+    
+    Expected JSON body:
+    {
+        "audio_url": "https://...",      // ElevenLabs audio URL or base64
+        "audio_base64": "...",           // Alternative: base64 audio
+        "images": [                       // List of image URLs or base64
+            "https://...",
+            ...
+        ],
+        "images_base64": [...],          // Alternative: list of base64 images
+        "script_text": "Full script...", // For captions
+        "add_captions": true,
+        "music_url": null                // Optional background music URL
+    }
+    """
     require_api_key()
     data = request.get_json(force=True)
-    if not data or "url" not in data:
-        abort(400, description="url is required")
-
-    job_id = str(uuid.uuid4())[:8]
-    job_dir = os.path.join(WORK_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-    out_path = os.path.join(job_dir, "video.mp4")
-
-    try:
-        meta = yt_download(data["url"], out_path)
-        # Build the public URL where this file will be served
-        if PUBLIC_URL:
-            public_link = f"{PUBLIC_URL.rstrip('/')}/files/{job_id}/video.mp4"
-        else:
-            public_link = url_for("serve_file", job_id=job_id, filename="video.mp4", _external=True)
-        return jsonify({
-            "url": public_link,
-            "title": meta.get("title", ""),
-            "duration": meta.get("duration", 0),
-            "uploader": meta.get("uploader", ""),
-            "job_id": job_id,
-        })
-    except Exception as e:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        abort(500, description=str(e))
-
-
-@app.get("/files/<job_id>/<filename>")
-def serve_file(job_id, filename):
-    """Serve a downloaded file (used by AssemblyAI to fetch the audio)."""
-    safe_id = "".join(c for c in job_id if c.isalnum() or c in "-_")
-    safe_name = "".join(c for c in filename if c.isalnum() or c in "-_.")
-    path = os.path.join(WORK_DIR, safe_id, safe_name)
-    if not os.path.exists(path):
-        abort(404)
-    return send_file(path, mimetype="video/mp4")
-
-
-@app.post("/process")
-def process():
-    require_api_key()
-    data = request.get_json(force=True)
-    if not data or "source_url" not in data:
-        abort(400, description="source_url is required")
+    if not data:
+        abort(400, description="JSON body required")
 
     job_id = str(uuid.uuid4())[:8]
     job_dir = os.path.join(WORK_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    src = os.path.join(job_dir, "src.mp4")
-    cut = os.path.join(job_dir, "cut.mp4")
-    vertical = os.path.join(job_dir, "vertical.mp4")
-    final = os.path.join(job_dir, "final.mp4")
-    subs = os.path.join(job_dir, "subs.ass")
-
     try:
-        # 1. Download source — either a YouTube URL or a direct mp4 link
-        src_url = data["source_url"]
-        if "youtube.com" in src_url or "youtu.be" in src_url:
-            yt_download(src_url, src)
+        # Step 1: Get audio file
+        audio_path = os.path.join(job_dir, "audio.mp3")
+        if data.get("audio_base64"):
+            with open(audio_path, "wb") as f:
+                f.write(base64.b64decode(data["audio_base64"]))
+        elif data.get("audio_url"):
+            r = requests.get(data["audio_url"], timeout=60)
+            r.raise_for_status()
+            with open(audio_path, "wb") as f:
+                f.write(r.content)
         else:
-            download_file(src_url, src)
+            abort(400, description="audio_url or audio_base64 required")
 
-        start = float(data.get("start", 0))
-        end = float(data.get("end", 60))
-        duration = end - start
-        if duration <= 0 or duration > 180:
-            abort(400, description="Duration must be between 0 and 180 seconds")
+        # Get audio duration
+        total_duration = get_audio_duration(audio_path)
+        if total_duration < 5 or total_duration > 90:
+            abort(400, description=f"Audio duration must be 5-90 sec (got {total_duration:.1f}s)")
 
-        # 2. Cut
+        # Step 2: Save images
+        images = data.get("images", [])
+        images_base64 = data.get("images_base64", [])
+        
+        image_paths = []
+        if images_base64:
+            for i, img_b64 in enumerate(images_base64):
+                img_path = os.path.join(job_dir, f"img_{i:02d}.png")
+                with open(img_path, "wb") as f:
+                    f.write(base64.b64decode(img_b64))
+                image_paths.append(img_path)
+        elif images:
+            for i, img_url in enumerate(images):
+                r = requests.get(img_url, timeout=30)
+                r.raise_for_status()
+                img_path = os.path.join(job_dir, f"img_{i:02d}.png")
+                with open(img_path, "wb") as f:
+                    f.write(r.content)
+                image_paths.append(img_path)
+        else:
+            abort(400, description="images or images_base64 required")
+
+        if not image_paths:
+            abort(400, description="At least 1 image required")
+
+        # Step 3: Calculate per-image duration
+        duration_per_image = total_duration / len(image_paths)
+
+        # Step 4: Create video from images (slideshow)
+        # Build concat file
+        concat_file = os.path.join(job_dir, "concat.txt")
+        with open(concat_file, "w") as f:
+            for img in image_paths:
+                f.write(f"file '{img}'\n")
+                f.write(f"duration {duration_per_image:.3f}\n")
+            # Last image needs to be repeated for proper duration
+            f.write(f"file '{image_paths[-1]}'\n")
+
+        # Create slideshow with ken-burns effect (subtle zoom)
+        slideshow_path = os.path.join(job_dir, "slideshow.mp4")
         run_ffmpeg([
             "ffmpeg", "-y",
-            "-ss", str(start), "-to", str(end),
-            "-i", src,
+            "-f", "concat", "-safe", "0", "-i", concat_file,
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(zoom+0.0015,1.5)':d=125:s=1080x1920:fps=30",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k",
-            cut,
+            "-pix_fmt", "yuv420p",
+            "-r", "30",
+            slideshow_path,
         ])
 
-        # 3. 9:16
-        aspect = data.get("aspect", "9:16")
-        if aspect == "9:16":
-            vf = "crop='min(iw\\,ih*9/16)':'min(ih\\,iw*16/9)',scale=1080:1920,setsar=1"
-        elif aspect == "1:1":
-            vf = "crop='min(iw\\,ih)':'min(iw\\,ih)',scale=1080:1080,setsar=1"
-        else:
-            vf = "scale=1080:1920,setsar=1"
-
+        # Step 5: Combine audio with video
+        with_audio_path = os.path.join(job_dir, "with_audio.mp4")
         run_ffmpeg([
-            "ffmpeg", "-y", "-i", cut,
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "copy",
-            vertical,
+            "ffmpeg", "-y",
+            "-i", slideshow_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-shortest",
+            with_audio_path,
         ])
 
-        # 4. Captions
-        if data.get("add_captions") and data.get("transcript_words"):
-            build_ass_subtitles(
-                data["transcript_words"], start, end, subs,
-                style=data.get("caption_style", "tiktok"),
-            )
+        # Step 6: Add captions if requested
+        final_path = with_audio_path
+        if data.get("add_captions") and data.get("script_text"):
+            subs_path = os.path.join(job_dir, "subs.ass")
+            build_captions(data["script_text"], total_duration, subs_path)
+            
+            captioned_path = os.path.join(job_dir, "final.mp4")
             run_ffmpeg([
-                "ffmpeg", "-y", "-i", vertical,
-                "-vf", f"ass={subs}",
+                "ffmpeg", "-y",
+                "-i", with_audio_path,
+                "-vf", f"ass={subs_path}",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                 "-c:a", "copy",
-                final,
+                captioned_path,
             ])
-            output_path = final
-        else:
-            output_path = vertical
+            final_path = captioned_path
 
-        return send_file(output_path, mimetype="video/mp4",
-                         as_attachment=True, download_name=f"short_{job_id}.mp4")
+        # Return the final video
+        return send_file(
+            final_path,
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"short_{job_id}.mp4"
+        )
 
     except requests.HTTPError as e:
-        abort(502, description=f"Could not download source video: {e}")
+        shutil.rmtree(job_dir, ignore_errors=True)
+        abort(502, description=f"Could not download media: {e}")
     except ValueError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
         abort(400, description=str(e))
     except RuntimeError as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
         abort(500, description=str(e))
 
 
