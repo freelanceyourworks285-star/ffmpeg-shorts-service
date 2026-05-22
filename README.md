@@ -106,6 +106,7 @@ curl -X POST http://localhost:8080/process \
   -d '{
     "source_url": "https://download.samplelib.com/mp4/sample-30s.mp4",
     "start": 0,
+deploy v6
     "end": 15,
     "aspect": "9:16",
     "add_captions": false
