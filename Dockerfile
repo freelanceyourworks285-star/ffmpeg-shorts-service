@@ -4,7 +4,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-liberation \
     fontconfig \
-    curl \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -f -v
 
@@ -14,10 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 
 ENV PORT=8080
-ENV WORK_DIR=/tmp/shorts
-ENV MAX_DOWNLOAD_MB=500
 
 EXPOSE 8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "2", \
+# IMPORTANT: exactly 1 worker so the in-RAM JOBS dict is shared across
+# all requests. Threads are fine (shared memory); multiple workers are NOT.
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", \
      "--timeout", "600", "--graceful-timeout", "30", "app:app"]
