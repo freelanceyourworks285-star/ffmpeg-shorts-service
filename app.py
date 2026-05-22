@@ -1,53 +1,32 @@
 """
-AI Shorts Generator microservice — v4 (URL-based, memory-safe).
+AI Shorts Generator microservice — v5 (URL-based, memory-safe, no-auth).
 
-Pipeline-friendly design:
-  POST /upload    — upload ONE file (image or audio). Returns a job_id + file URL.
-                    n8n calls this once per image and once for the audio, so
-                    n8n never holds more than one file in memory at a time.
-  POST /assemble  — given a job_id, assembles all uploaded files into a
-                    9:16 vertical short with Ken Burns zoom + word captions.
-  GET  /file/<id> — serves an uploaded/produced file (used internally + for result).
+Same as v4 but the API-key check is REMOVED entirely, so the service
+works regardless of whether an API_KEY env var is still set on Render.
+
+Endpoints:
+  POST /upload    — upload ONE file (image or audio). Returns job_id + info.
+  POST /assemble  — assemble all uploaded files for a job into a 9:16 short.
   GET  /health    — health check.
-
-Why: passing 6 images + audio as base64 through n8n crashes it (OOM).
-With /upload, each file is sent individually and stored server-side; only
-small JSON (job_id, urls) travels through n8n.
 """
 import os
 import uuid
 import time
 import shutil
 import base64
-import threading
 import subprocess
 
-import requests
-from flask import Flask, request, send_file, jsonify, abort, url_for
+from flask import Flask, request, send_file, jsonify, abort
 
 app = Flask(__name__)
 
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp/shorts")
-API_KEY = os.environ.get("API_KEY")
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "https://ffmpeg-shorts-service.onrender.com"
-)
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# Jobs older than this many seconds get cleaned up.
 JOB_TTL_SECONDS = 3600
 
 
-def require_api_key():
-    if not API_KEY:
-        return
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {API_KEY}":
-        abort(401, description="Invalid or missing API key")
-
-
 def job_path(job_id: str) -> str:
-    # Basic sanitisation — job_id is always our own uuid hex.
     safe = "".join(c for c in job_id if c.isalnum())
     return os.path.join(WORK_DIR, safe)
 
@@ -122,7 +101,6 @@ def build_captions(script_text: str, total_duration: float, out_path: str) -> No
 
 
 def cleanup_old_jobs() -> None:
-    """Remove job folders older than JOB_TTL_SECONDS."""
     now = time.time()
     try:
         for name in os.listdir(WORK_DIR):
@@ -139,27 +117,14 @@ def health():
         subprocess.run(["ffmpeg", "-version"], capture_output=True,
                        check=True, timeout=5)
         return jsonify({"status": "ok", "ffmpeg": "available",
-                        "service": "ai-shorts-v4"})
+                        "service": "ai-shorts-v5"})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
 
 @app.post("/upload")
 def upload():
-    """
-    Upload ONE file to a job. Memory-safe: n8n sends one file at a time.
-
-    JSON body:
-    {
-        "job_id": "abc123"      // optional; omit to start a new job
-        "kind": "image" | "audio",
-        "file_base64": "...",   // the file content (one file only)
-        "index": 0               // for images: ordering (0-5). ignored for audio
-    }
-
-    Returns: { "job_id": "...", "kind": "...", "stored": "img_00.png", "count": N }
-    """
-    require_api_key()
+    """Upload ONE file (image or audio) to a job. No auth required."""
     cleanup_old_jobs()
 
     data = request.get_json(force=True, silent=True) or {}
@@ -200,19 +165,7 @@ def upload():
 
 @app.post("/assemble")
 def assemble():
-    """
-    Assemble a short from files already uploaded via /upload.
-
-    JSON body:
-    {
-        "job_id": "abc123",
-        "script_text": "for captions",
-        "add_captions": true
-    }
-
-    Returns the final MP4 file.
-    """
-    require_api_key()
+    """Assemble a short from files uploaded via /upload. No auth required."""
     data = request.get_json(force=True, silent=True) or {}
     job_id = data.get("job_id")
     if not job_id:
@@ -240,7 +193,6 @@ def assemble():
 
         duration_per_image = total_duration / len(image_paths)
 
-        # 1. Slideshow with Ken Burns zoom.
         concat_file = os.path.join(jdir, "concat.txt")
         with open(concat_file, "w") as f:
             for img in image_paths:
@@ -261,7 +213,6 @@ def assemble():
             slideshow_path,
         ])
 
-        # 2. Mux audio.
         with_audio_path = os.path.join(jdir, "with_audio.mp4")
         run_ffmpeg([
             "ffmpeg", "-y",
@@ -271,7 +222,6 @@ def assemble():
             with_audio_path,
         ])
 
-        # 3. Optional captions.
         final_path = with_audio_path
         if data.get("add_captions") and data.get("script_text"):
             subs_path = os.path.join(jdir, "subs.ass")
@@ -298,7 +248,6 @@ def assemble():
 
 
 @app.errorhandler(400)
-@app.errorhandler(401)
 @app.errorhandler(404)
 @app.errorhandler(500)
 @app.errorhandler(502)
