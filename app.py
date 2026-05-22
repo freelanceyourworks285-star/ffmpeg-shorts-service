@@ -1,23 +1,26 @@
 """
-AI Shorts Generator microservice — v6 (RAM storage, memory-safe, no-auth).
+AI Shorts Generator microservice — v7 (STATELESS, no-auth).
 
-Why v6: on Render's free tier the /tmp directory did not reliably persist
-files between separate HTTP requests, so uploaded images vanished and
-/assemble saw "no images". v6 keeps uploaded files in a module-level
-Python dict (RAM). With a single gunicorn worker this dict is shared
-across all requests for the lifetime of the service process — no disk
-dependency.
+Why v7: v6 stored uploaded files in a module-level Python dict (RAM).
+On Render's free tier that dict was NOT shared reliably across separate
+HTTP requests — either gunicorn ran more than one worker (each with its
+own dict) or the free instance spun down between requests, wiping RAM.
+Result: every /upload reported image_count=1 and /assemble failed with
+"no images uploaded for this job".
+
+v7 removes the whole problem: there is NO upload step and NO server-side
+state. The client sends EVERYTHING — audio + all images — in ONE single
+/assemble request as base64. Each request is fully self-contained, so it
+does not matter how many workers run or whether the instance restarts.
 
 Endpoints:
-  POST /upload    — upload ONE file (image or audio) into the in-RAM job.
-  POST /assemble  — assemble all files for a job into a 9:16 short.
+  POST /assemble  — assemble a 9:16 short from audio + images in one call.
   GET  /health    — health check.
-  GET  /job/<id>  — debug: see what's stored for a job.
+
+/upload and /job/<id> have been removed (no longer needed).
 """
 import os
 import io
-import time
-import uuid
 import base64
 import shutil
 import tempfile
@@ -27,16 +30,8 @@ from flask import Flask, request, send_file, jsonify, abort
 
 app = Flask(__name__)
 
-# In-RAM job store:  job_id -> { "audio": bytes, "images": {index: bytes}, "ts": float }
-JOBS = {}
-JOB_TTL_SECONDS = 3600
-
-
-def cleanup_old_jobs() -> None:
-    now = time.time()
-    stale = [jid for jid, j in JOBS.items() if now - j.get("ts", now) > JOB_TTL_SECONDS]
-    for jid in stale:
-        JOBS.pop(jid, None)
+# Safety cap so a malformed request can't OOM the free instance.
+MAX_IMAGES = 12
 
 
 def run_ffmpeg(cmd: list) -> None:
@@ -108,98 +103,71 @@ def build_captions(script_text: str, total_duration: float, out_path: str) -> No
         f.write(header + "\n".join(events))
 
 
+def _decode_b64(value, label: str) -> bytes:
+    """Decode a base64 string, tolerating data: URI prefixes and whitespace."""
+    if not value or not isinstance(value, str):
+        abort(400, description=f"{label} is required and must be a base64 string")
+    if "," in value and value.strip().startswith("data:"):
+        value = value.split(",", 1)[1]
+    try:
+        return base64.b64decode(value)
+    except Exception:
+        abort(400, description=f"{label} is not valid base64")
+
+
 @app.get("/health")
 def health():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True,
                        check=True, timeout=5)
         return jsonify({"status": "ok", "ffmpeg": "available",
-                        "service": "ai-shorts-v6",
-                        "active_jobs": len(JOBS)})
+                        "service": "ai-shorts-v7"})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
 
-@app.get("/job/<job_id>")
-def job_info(job_id):
-    j = JOBS.get(job_id)
-    if not j:
-        return jsonify({"exists": False, "job_id": job_id})
-    return jsonify({
-        "exists": True,
-        "job_id": job_id,
-        "has_audio": j.get("audio") is not None,
-        "image_count": len(j.get("images", {})),
-        "image_indexes": sorted(j.get("images", {}).keys()),
-    })
-
-
-@app.post("/upload")
-def upload():
-    """Upload ONE file (image or audio) into the in-RAM job store."""
-    cleanup_old_jobs()
-
-    data = request.get_json(force=True, silent=True) or {}
-    kind = data.get("kind")
-    file_b64 = data.get("file_base64")
-    if kind not in ("image", "audio"):
-        abort(400, description="kind must be 'image' or 'audio'")
-    if not file_b64:
-        abort(400, description="file_base64 is required")
-
-    job_id = data.get("job_id") or uuid.uuid4().hex[:12]
-
-    try:
-        raw = base64.b64decode(file_b64)
-    except Exception:
-        abort(400, description="file_base64 is not valid base64")
-
-    job = JOBS.setdefault(job_id, {"audio": None, "images": {}, "ts": time.time()})
-    job["ts"] = time.time()
-
-    if kind == "audio":
-        job["audio"] = raw
-    else:
-        idx = int(data.get("index", 0))
-        job["images"][idx] = raw
-
-    return jsonify({
-        "job_id": job_id,
-        "kind": kind,
-        "image_count": len(job["images"]),
-        "has_audio": job["audio"] is not None,
-        "bytes": len(raw),
-    })
-
-
 @app.post("/assemble")
 def assemble():
-    """Assemble a short from files held in RAM for this job."""
+    """
+    Assemble a 9:16 short in ONE stateless call.
+
+    Expected JSON body:
+      {
+        "audio_base64":  "<base64 mp3>",          # required
+        "images_base64": ["<b64>", "<b64>", ...], # required, 1..MAX_IMAGES
+        "add_captions":  true,                    # optional
+        "script_text":   "narration text",        # optional, used if add_captions
+        "job_id":        "abc123"                 # optional, only for the filename
+      }
+    Returns: video/mp4 file attachment.
+    """
     data = request.get_json(force=True, silent=True) or {}
-    job_id = data.get("job_id")
-    if not job_id:
-        abort(400, description="job_id is required")
 
-    job = JOBS.get(job_id)
-    if not job:
-        abort(404, description=f"job '{job_id}' not found or expired")
-    if not job.get("audio"):
-        abort(400, description="no audio uploaded for this job")
-    if not job.get("images"):
-        abort(400, description="no images uploaded for this job")
+    job_id = data.get("job_id") or "short"
+    audio_bytes = _decode_b64(data.get("audio_base64"), "audio_base64")
 
-    # Write RAM files to a temp working dir just for ffmpeg.
+    images_b64 = data.get("images_base64")
+    if not isinstance(images_b64, list) or not images_b64:
+        abort(400, description="images_base64 must be a non-empty array")
+    if len(images_b64) > MAX_IMAGES:
+        abort(400, description=f"too many images (max {MAX_IMAGES})")
+
+    image_bytes_list = [
+        _decode_b64(img, f"images_base64[{i}]")
+        for i, img in enumerate(images_b64)
+    ]
+
     work = tempfile.mkdtemp(prefix="short_")
     try:
         audio_path = os.path.join(work, "audio.mp3")
         with open(audio_path, "wb") as f:
-            f.write(job["audio"])
+            f.write(audio_bytes)
 
         image_paths = []
-        for idx in sorted(job["images"].keys()):
+        for idx, raw in enumerate(image_bytes_list):
             p = os.path.join(work, f"img_{idx:02d}.png")
             with open(p, "wb") as f:
-                f.write(job["images"][idx])
+                f.write(raw)
             image_paths.append(p)
 
         total_duration = get_audio_duration(audio_path)
@@ -252,11 +220,9 @@ def assemble():
             ])
             final_path = captioned_path
 
-        # Load result into memory, then free the job + temp dir.
         with open(final_path, "rb") as f:
             video_bytes = f.read()
 
-        JOBS.pop(job_id, None)
         shutil.rmtree(work, ignore_errors=True)
 
         return send_file(
