@@ -1,34 +1,42 @@
 """
-AI Shorts Generator microservice — v5 (URL-based, memory-safe, no-auth).
+AI Shorts Generator microservice — v6 (RAM storage, memory-safe, no-auth).
 
-Same as v4 but the API-key check is REMOVED entirely, so the service
-works regardless of whether an API_KEY env var is still set on Render.
+Why v6: on Render's free tier the /tmp directory did not reliably persist
+files between separate HTTP requests, so uploaded images vanished and
+/assemble saw "no images". v6 keeps uploaded files in a module-level
+Python dict (RAM). With a single gunicorn worker this dict is shared
+across all requests for the lifetime of the service process — no disk
+dependency.
 
 Endpoints:
-  POST /upload    — upload ONE file (image or audio). Returns job_id + info.
-  POST /assemble  — assemble all uploaded files for a job into a 9:16 short.
+  POST /upload    — upload ONE file (image or audio) into the in-RAM job.
+  POST /assemble  — assemble all files for a job into a 9:16 short.
   GET  /health    — health check.
+  GET  /job/<id>  — debug: see what's stored for a job.
 """
 import os
-import uuid
+import io
 import time
-import shutil
+import uuid
 import base64
+import shutil
+import tempfile
 import subprocess
 
 from flask import Flask, request, send_file, jsonify, abort
 
 app = Flask(__name__)
 
-WORK_DIR = os.environ.get("WORK_DIR", "/tmp/shorts")
-os.makedirs(WORK_DIR, exist_ok=True)
-
+# In-RAM job store:  job_id -> { "audio": bytes, "images": {index: bytes}, "ts": float }
+JOBS = {}
 JOB_TTL_SECONDS = 3600
 
 
-def job_path(job_id: str) -> str:
-    safe = "".join(c for c in job_id if c.isalnum())
-    return os.path.join(WORK_DIR, safe)
+def cleanup_old_jobs() -> None:
+    now = time.time()
+    stale = [jid for jid, j in JOBS.items() if now - j.get("ts", now) > JOB_TTL_SECONDS]
+    for jid in stale:
+        JOBS.pop(jid, None)
 
 
 def run_ffmpeg(cmd: list) -> None:
@@ -100,31 +108,35 @@ def build_captions(script_text: str, total_duration: float, out_path: str) -> No
         f.write(header + "\n".join(events))
 
 
-def cleanup_old_jobs() -> None:
-    now = time.time()
-    try:
-        for name in os.listdir(WORK_DIR):
-            p = os.path.join(WORK_DIR, name)
-            if os.path.isdir(p) and now - os.path.getmtime(p) > JOB_TTL_SECONDS:
-                shutil.rmtree(p, ignore_errors=True)
-    except Exception:
-        pass
-
-
 @app.get("/health")
 def health():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True,
                        check=True, timeout=5)
         return jsonify({"status": "ok", "ffmpeg": "available",
-                        "service": "ai-shorts-v5"})
+                        "service": "ai-shorts-v6",
+                        "active_jobs": len(JOBS)})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
 
+@app.get("/job/<job_id>")
+def job_info(job_id):
+    j = JOBS.get(job_id)
+    if not j:
+        return jsonify({"exists": False, "job_id": job_id})
+    return jsonify({
+        "exists": True,
+        "job_id": job_id,
+        "has_audio": j.get("audio") is not None,
+        "image_count": len(j.get("images", {})),
+        "image_indexes": sorted(j.get("images", {}).keys()),
+    })
+
+
 @app.post("/upload")
 def upload():
-    """Upload ONE file (image or audio) to a job. No auth required."""
+    """Upload ONE file (image or audio) into the in-RAM job store."""
     cleanup_old_jobs()
 
     data = request.get_json(force=True, silent=True) or {}
@@ -136,71 +148,74 @@ def upload():
         abort(400, description="file_base64 is required")
 
     job_id = data.get("job_id") or uuid.uuid4().hex[:12]
-    jdir = job_path(job_id)
-    os.makedirs(jdir, exist_ok=True)
 
     try:
         raw = base64.b64decode(file_b64)
     except Exception:
         abort(400, description="file_base64 is not valid base64")
 
+    job = JOBS.setdefault(job_id, {"audio": None, "images": {}, "ts": time.time()})
+    job["ts"] = time.time()
+
     if kind == "audio":
-        fname = "audio.mp3"
+        job["audio"] = raw
     else:
         idx = int(data.get("index", 0))
-        fname = f"img_{idx:02d}.png"
+        job["images"][idx] = raw
 
-    with open(os.path.join(jdir, fname), "wb") as f:
-        f.write(raw)
-
-    img_count = len([n for n in os.listdir(jdir) if n.startswith("img_")])
     return jsonify({
         "job_id": job_id,
         "kind": kind,
-        "stored": fname,
-        "image_count": img_count,
+        "image_count": len(job["images"]),
+        "has_audio": job["audio"] is not None,
         "bytes": len(raw),
     })
 
 
 @app.post("/assemble")
 def assemble():
-    """Assemble a short from files uploaded via /upload. No auth required."""
+    """Assemble a short from files held in RAM for this job."""
     data = request.get_json(force=True, silent=True) or {}
     job_id = data.get("job_id")
     if not job_id:
         abort(400, description="job_id is required")
 
-    jdir = job_path(job_id)
-    if not os.path.isdir(jdir):
+    job = JOBS.get(job_id)
+    if not job:
         abort(404, description=f"job '{job_id}' not found or expired")
-
-    audio_path = os.path.join(jdir, "audio.mp3")
-    if not os.path.exists(audio_path):
+    if not job.get("audio"):
         abort(400, description="no audio uploaded for this job")
-
-    image_paths = sorted(
-        os.path.join(jdir, n) for n in os.listdir(jdir)
-        if n.startswith("img_")
-    )
-    if not image_paths:
+    if not job.get("images"):
         abort(400, description="no images uploaded for this job")
 
+    # Write RAM files to a temp working dir just for ffmpeg.
+    work = tempfile.mkdtemp(prefix="short_")
     try:
+        audio_path = os.path.join(work, "audio.mp3")
+        with open(audio_path, "wb") as f:
+            f.write(job["audio"])
+
+        image_paths = []
+        for idx in sorted(job["images"].keys()):
+            p = os.path.join(work, f"img_{idx:02d}.png")
+            with open(p, "wb") as f:
+                f.write(job["images"][idx])
+            image_paths.append(p)
+
         total_duration = get_audio_duration(audio_path)
         if total_duration < 3 or total_duration > 120:
             abort(400, description=f"audio duration out of range: {total_duration:.1f}s")
 
         duration_per_image = total_duration / len(image_paths)
 
-        concat_file = os.path.join(jdir, "concat.txt")
+        concat_file = os.path.join(work, "concat.txt")
         with open(concat_file, "w") as f:
             for img in image_paths:
                 f.write(f"file '{img}'\n")
                 f.write(f"duration {duration_per_image:.3f}\n")
             f.write(f"file '{image_paths[-1]}'\n")
 
-        slideshow_path = os.path.join(jdir, "slideshow.mp4")
+        slideshow_path = os.path.join(work, "slideshow.mp4")
         run_ffmpeg([
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", concat_file,
@@ -213,7 +228,7 @@ def assemble():
             slideshow_path,
         ])
 
-        with_audio_path = os.path.join(jdir, "with_audio.mp4")
+        with_audio_path = os.path.join(work, "with_audio.mp4")
         run_ffmpeg([
             "ffmpeg", "-y",
             "-i", slideshow_path, "-i", audio_path,
@@ -224,9 +239,9 @@ def assemble():
 
         final_path = with_audio_path
         if data.get("add_captions") and data.get("script_text"):
-            subs_path = os.path.join(jdir, "subs.ass")
+            subs_path = os.path.join(work, "subs.ass")
             build_captions(data["script_text"], total_duration, subs_path)
-            captioned_path = os.path.join(jdir, "final.mp4")
+            captioned_path = os.path.join(work, "final.mp4")
             run_ffmpeg([
                 "ffmpeg", "-y",
                 "-i", with_audio_path,
@@ -237,13 +252,25 @@ def assemble():
             ])
             final_path = captioned_path
 
-        return send_file(final_path, mimetype="video/mp4",
-                         as_attachment=True,
-                         download_name=f"short_{job_id}.mp4")
+        # Load result into memory, then free the job + temp dir.
+        with open(final_path, "rb") as f:
+            video_bytes = f.read()
+
+        JOBS.pop(job_id, None)
+        shutil.rmtree(work, ignore_errors=True)
+
+        return send_file(
+            io.BytesIO(video_bytes),
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"short_{job_id}.mp4",
+        )
 
     except RuntimeError as e:
+        shutil.rmtree(work, ignore_errors=True)
         abort(500, description=str(e))
     except ValueError as e:
+        shutil.rmtree(work, ignore_errors=True)
         abort(400, description=str(e))
 
 
