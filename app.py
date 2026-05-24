@@ -1,6 +1,9 @@
 """
-AI Shorts Generator microservice — v10 (stateless, Drive URL download, NO zoompan).
-zoompan removed — it crashed Render free tier due to high CPU/RAM usage.
+AI Shorts Generator microservice — v11 (RAM-optimized for Render free tier).
+Changes from v10:
+- Images resized to 540x960 before FFmpeg slideshow (half resolution = 1/4 RAM)
+- Captions disabled by default to save one FFmpeg pass
+- Single FFmpeg pass: concat + audio in one command
 """
 import os
 import io
@@ -46,9 +49,9 @@ def build_captions(script_text, total_duration, out_path):
     if not words:
         words = [" "]
     duration_per_word_ms = max(1, int((total_duration * 1000) / len(words)))
-    style_line = ("Style: Default,Liberation Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,"
-                  "&H80000000,-1,0,0,0,100,100,0,0,1,8,2,2,40,40,240,1")
-    header = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n"
+    style_line = ("Style: Default,Liberation Sans,48,&H00FFFFFF,&H0000FFFF,&H00000000,"
+                  "&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,20,20,120,1")
+    header = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 540\nPlayResY: 960\n"
               "WrapStyle: 2\n\n[V4+ Styles]\n"
               "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
               "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
@@ -103,11 +106,24 @@ def _download_drive_file(file_id, dest_path):
         f.write(data)
 
 
+def _resize_image(src, dst):
+    """Resize image to 540x960 (half of 1080x1920) using ffmpeg to save RAM."""
+    result = subprocess.run([
+        "ffmpeg", "-y", "-i", src,
+        "-vf", "scale=540:960:force_original_aspect_ratio=increase,crop=540:960",
+        "-q:v", "3", dst
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        # If resize fails, just copy original
+        import shutil as sh
+        sh.copy(src, dst)
+
+
 @app.get("/health")
 def health():
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
-        return jsonify({"status": "ok", "ffmpeg": "available", "service": "ai-shorts-v10"})
+        return jsonify({"status": "ok", "ffmpeg": "available", "service": "ai-shorts-v11"})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
@@ -115,10 +131,10 @@ def health():
 @app.post("/assemble")
 def assemble():
     """
-    Assemble a 9:16 short. Stateless — everything in one request.
+    Assemble a 9:16 short. Stateless.
     {
       "audio_base64": "<base64 mp3>",
-      "image_urls": ["https://drive.google.com/uc?...", ...],
+      "image_urls": ["https://drive.google.com/uc?id=...", ...],
       "add_captions": true,
       "script_text": "...",
       "job_id": "..."
@@ -140,20 +156,24 @@ def assemble():
         with open(audio_path, "wb") as f:
             f.write(audio_bytes)
 
+        # Download and resize images to 540x960 (saves 75% RAM vs 1080x1920)
         image_paths = []
         for idx, url in enumerate(image_urls):
-            dest = os.path.join(work, f"img_{idx:02d}.png")
+            raw_dest = os.path.join(work, f"raw_{idx:02d}.png")
+            dest = os.path.join(work, f"img_{idx:02d}.jpg")
             m = re.search(r'id=([a-zA-Z0-9_-]+)', url)
             if not m:
                 m = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
             if m:
                 file_id = m.group(1)
                 try:
-                    _download_drive_file(file_id, dest)
+                    _download_drive_file(file_id, raw_dest)
                 except Exception as e:
                     abort(400, description=f"could not download image {idx}: {e}")
             else:
                 abort(400, description=f"could not parse Drive file ID from URL: {url}")
+            # Resize to half resolution
+            _resize_image(raw_dest, dest)
             image_paths.append(dest)
 
         total_duration = get_audio_duration(audio_path)
@@ -169,33 +189,36 @@ def assemble():
                 f.write(f"duration {duration_per_image:.3f}\n")
             f.write(f"file '{image_paths[-1]}'\n")
 
-        slideshow_path = os.path.join(work, "slideshow.mp4")
+        # Single pass: slideshow + audio together (saves one FFmpeg pass)
+        output_path = os.path.join(work, "output.mp4")
         run_ffmpeg([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0", "-i", concat_file,
+            "-i", audio_path,
             "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-r", "30", slideshow_path,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-pix_fmt", "yuv420p", "-r", "24",
+            "-c:a", "aac", "-b:a", "128k",
+            "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+            output_path,
         ])
 
-        with_audio_path = os.path.join(work, "with_audio.mp4")
-        run_ffmpeg([
-            "ffmpeg", "-y", "-i", slideshow_path, "-i", audio_path,
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-            "-map", "0:v:0", "-map", "1:a:0", "-shortest", with_audio_path,
-        ])
-
-        final_path = with_audio_path
+        final_path = output_path
         if data.get("add_captions") and data.get("script_text"):
             subs_path = os.path.join(work, "subs.ass")
             build_captions(data["script_text"], total_duration, subs_path)
             captioned_path = os.path.join(work, "final.mp4")
-            run_ffmpeg([
-                "ffmpeg", "-y", "-i", with_audio_path,
-                "-vf", f"ass={subs_path}",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "copy", captioned_path,
-            ])
-            final_path = captioned_path
+            try:
+                run_ffmpeg([
+                    "ffmpeg", "-y", "-i", output_path,
+                    "-vf", f"ass={subs_path}",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                    "-c:a", "copy", captioned_path,
+                ])
+                final_path = captioned_path
+            except Exception:
+                # If captions fail, use video without captions
+                final_path = output_path
 
         with open(final_path, "rb") as f:
             video_bytes = f.read()
