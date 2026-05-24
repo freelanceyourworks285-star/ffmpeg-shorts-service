@@ -18,5 +18,4 @@ EXPOSE 8080
 
 # IMPORTANT: exactly 1 worker so the in-RAM JOBS dict is shared across
 # all requests. Threads are fine (shared memory); multiple workers are NOT.
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "4", \
-     "--timeout", "600", "--graceful-timeout", "30", "app:app"]
+CMD ["gunicorn", "app:app", "--workers", "1", "--bind", "0.0.0.0:10000", "--timeout", "600", "--graceful-timeout", "600"]
