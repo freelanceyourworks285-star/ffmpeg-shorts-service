@@ -1,23 +1,17 @@
 """
-AI Shorts Generator microservice — v7 (STATELESS, no-auth).
+AI Shorts Generator microservice — v8 (STATELESS, URL-based images).
 
-Why v7: v6 stored uploaded files in a module-level Python dict (RAM).
-On Render's free tier that dict was NOT shared reliably across separate
-HTTP requests — either gunicorn ran more than one worker (each with its
-own dict) or the free instance spun down between requests, wiping RAM.
-Result: every /upload reported image_count=1 and /assemble failed with
-"no images uploaded for this job".
+Why v8: v7 accepted audio+images as base64 in one request, but n8n cloud
+ran out of memory holding 6 large images in RAM simultaneously.
 
-v7 removes the whole problem: there is NO upload step and NO server-side
-state. The client sends EVERYTHING — audio + all images — in ONE single
-/assemble request as base64. Each request is fully self-contained, so it
-does not matter how many workers run or whether the instance restarts.
+v8 fix: images are passed as Google Drive download URLs (or any public URL).
+The service downloads each image itself — n8n only needs to pass small URLs,
+not megabytes of base64. Audio is still sent as base64 (it's small ~700KB).
 
 Endpoints:
-  POST /assemble  — assemble a 9:16 short from audio + images in one call.
+  POST /assemble  — assemble a 9:16 short. Accepts:
+                    { audio_base64, image_urls: [...], script_text, add_captions, job_id }
   GET  /health    — health check.
-
-/upload and /job/<id> have been removed (no longer needed).
 """
 import os
 import io
@@ -25,12 +19,11 @@ import base64
 import shutil
 import tempfile
 import subprocess
+import urllib.request
 
 from flask import Flask, request, send_file, jsonify, abort
 
 app = Flask(__name__)
-
-# Safety cap so a malformed request can't OOM the free instance.
 MAX_IMAGES = 12
 
 
@@ -50,7 +43,7 @@ def get_audio_duration(audio_path: str) -> float:
     result = subprocess.run(cmd, capture_output=True, text=True)
     out = (result.stdout or "").strip()
     if not out:
-        raise RuntimeError("could not read audio duration (empty audio?)")
+        raise RuntimeError("could not read audio duration")
     return float(out)
 
 
@@ -67,7 +60,6 @@ def build_captions(script_text: str, total_duration: float, out_path: str) -> No
     if not words:
         words = [" "]
     duration_per_word_ms = max(1, int((total_duration * 1000) / len(words)))
-
     style_line = (
         "Style: Default,Liberation Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,"
         "&H80000000,-1,0,0,0,100,100,0,0,1,8,2,2,40,40,240,1"
@@ -80,31 +72,25 @@ def build_captions(script_text: str, total_duration: float, out_path: str) -> No
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
         f"{style_line}\n\n[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
-        "Effect, Text\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-
     events = []
     phrase_size = 3
     current_ms = 0
     for i in range(0, len(words), phrase_size):
         phrase = words[i:i + phrase_size]
         phrase_ms = duration_per_word_ms * len(phrase)
-        start_ms = current_ms
-        end_ms = current_ms + phrase_ms
         text = " ".join(w.upper() for w in phrase).replace("\n", " ")
         events.append(
-            f"Dialogue: 0,{ms_to_ass_time(start_ms)},{ms_to_ass_time(end_ms)},"
+            f"Dialogue: 0,{ms_to_ass_time(current_ms)},{ms_to_ass_time(current_ms + phrase_ms)},"
             f"Default,,0,0,0,,{text}"
         )
-        current_ms = end_ms
-
+        current_ms += phrase_ms
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(events))
 
 
 def _decode_b64(value, label: str) -> bytes:
-    """Decode a base64 string, tolerating data: URI prefixes and whitespace."""
     if not value or not isinstance(value, str):
         abort(400, description=f"{label} is required and must be a base64 string")
     if "," in value and value.strip().startswith("data:"):
@@ -115,13 +101,26 @@ def _decode_b64(value, label: str) -> bytes:
         abort(400, description=f"{label} is not valid base64")
 
 
+def _download_url(url: str, dest_path: str) -> None:
+    """Download a URL to dest_path. Supports Google Drive export links."""
+    # Convert Google Drive view URLs to direct download URLs
+    if "drive.google.com" in url:
+        import re
+        m = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
+        if m:
+            file_id = m.group(1)
+            url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        with open(dest_path, "wb") as f:
+            f.write(resp.read())
+
+
 @app.get("/health")
 def health():
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True,
-                       check=True, timeout=5)
-        return jsonify({"status": "ok", "ffmpeg": "available",
-                        "service": "ai-shorts-v7"})
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=5)
+        return jsonify({"status": "ok", "ffmpeg": "available", "service": "ai-shorts-v8"})
     except Exception as e:
         return jsonify({"status": "degraded", "error": str(e)}), 503
 
@@ -129,33 +128,28 @@ def health():
 @app.post("/assemble")
 def assemble():
     """
-    Assemble a 9:16 short in ONE stateless call.
+    Assemble a 9:16 short. Stateless — everything in one request.
 
-    Expected JSON body:
+    JSON body:
       {
-        "audio_base64":  "<base64 mp3>",          # required
-        "images_base64": ["<b64>", "<b64>", ...], # required, 1..MAX_IMAGES
-        "add_captions":  true,                    # optional
-        "script_text":   "narration text",        # optional, used if add_captions
-        "job_id":        "abc123"                 # optional, only for the filename
+        "audio_base64":  "<base64 mp3>",           # required
+        "image_urls":    ["<url>", ...],            # required, 1..12 Google Drive or public URLs
+        "add_captions":  true,                      # optional
+        "script_text":   "narration text",          # optional, used if add_captions
+        "job_id":        "abc123"                   # optional, for filename
       }
-    Returns: video/mp4 file attachment.
+    Returns: video/mp4 attachment.
     """
     data = request.get_json(force=True, silent=True) or {}
-
     job_id = data.get("job_id") or "short"
+
     audio_bytes = _decode_b64(data.get("audio_base64"), "audio_base64")
 
-    images_b64 = data.get("images_base64")
-    if not isinstance(images_b64, list) or not images_b64:
-        abort(400, description="images_base64 must be a non-empty array")
-    if len(images_b64) > MAX_IMAGES:
+    image_urls = data.get("image_urls")
+    if not isinstance(image_urls, list) or not image_urls:
+        abort(400, description="image_urls must be a non-empty array of URLs")
+    if len(image_urls) > MAX_IMAGES:
         abort(400, description=f"too many images (max {MAX_IMAGES})")
-
-    image_bytes_list = [
-        _decode_b64(img, f"images_base64[{i}]")
-        for i, img in enumerate(images_b64)
-    ]
 
     work = tempfile.mkdtemp(prefix="short_")
     try:
@@ -164,10 +158,12 @@ def assemble():
             f.write(audio_bytes)
 
         image_paths = []
-        for idx, raw in enumerate(image_bytes_list):
+        for idx, url in enumerate(image_urls):
             p = os.path.join(work, f"img_{idx:02d}.png")
-            with open(p, "wb") as f:
-                f.write(raw)
+            try:
+                _download_url(url, p)
+            except Exception as e:
+                abort(400, description=f"could not download image {idx}: {e}")
             image_paths.append(p)
 
         total_duration = get_audio_duration(audio_path)
